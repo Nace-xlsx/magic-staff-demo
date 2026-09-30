@@ -1,5 +1,14 @@
--- Connected Discord-GitHub
 --!strict
+--[[
+	Fireball staff (client-side demo).
+
+	Flow: staff activated -> charging (fireball grows, speed rises, aim preview is drawn)
+	-> released -> fireball is simulated with custom ballistics (gravity, drag, spherecast
+	collisions, bounces) -> explodes after the last allowed bounce.
+
+	Physics run at a fixed step so the aim preview matches the real flight.
+	Everything is client-side, so explosions are only visible to the local player.
+]]
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -14,540 +23,547 @@ local background = chargeGui:WaitForChild("Background")
 local chargeFill = background:WaitForChild("ChargeBar") :: Frame
 local cooldownLabel = background:WaitForChild("Cooldown") :: TextLabel
 
-local chargeStart = 0
-local cooldownEnd = 0
+-- Without this the GUI is destroyed on respawn and the references above go stale
+chargeGui.ResetOnSpawn = false
 
 local fireballTemplate = ReplicatedStorage:WaitForChild("FireballModel") :: Model
 local staffTemplate = ReplicatedStorage:WaitForChild("Staff") :: Tool
 
 local CONFIG = {
-	-- MIN and MAX speed for the fireball
-	MIN_SPEED = 40,			
-	MAX_SPEED = 140,	
-	
-	-- MIN and MAX size for the fireball	
-	MIN_SIZE = 0.5,			
-	MAX_SIZE = 2.5,		
-	
-	CHARGE_TIME = 1.5,		-- Maximum charge time of the staff
-	UPWARD_VELOCITY = 20,	-- Vertical velocity when the fireball is launched	
-	HOLD_DISTANCE = 5,		-- Distance the fireball is held from the player
-	HOLD_HEIGHT = 1.5,		-- Height the fireball is held above the player
-	COOLDOWN = 0.5,			-- Time between shots
-	LIFETIME = 10,			-- Time before fireball is removed
-	SKIN = 0.05,			-- Skin thickness for calculating collisions
-	
+	-- Launch speed range, scaled by charge
+	MIN_SPEED = 40,
+	MAX_SPEED = 140,
+
+	-- Fireball scale range, scaled by charge
+	MIN_SIZE = 0.5,
+	MAX_SIZE = 2.5,
+
+	CHARGE_TIME = 1.5,      -- Seconds to reach full charge
+	UPWARD_VELOCITY = 20,   -- Vertical velocity added to every launch
+	HOLD_DISTANCE = 5,      -- Distance the fireball is held from the player
+	HOLD_HEIGHT = 1.5,      -- Height the fireball is held above the player
+	COOLDOWN = 0.5,         -- Seconds between shots
+	LIFETIME = 10,          -- Seconds before an unexploded fireball is removed
+	SKIN = 0.05,            -- Gap kept between the fireball and surfaces it touches
+
 	-- Roblox explosion values
-	BLAST_RADIUS = 10,		
+	BLAST_RADIUS = 10,
 	BLAST_PRESSURE = 10000,
-	
-	MAX_BOUNCES = 3,		-- Bounces before fireball is removed
-	DRAG = 0.15,			-- Air resistance
-	RESTITUTION = 0.7,		-- % of velocity kept after a bounce
-	
-	-- Aim preview values
-	PREVIEW_STEP = 1 / 30,	-- Time between motion steps 
-	PREVIEW_TIME = 2,		-- Time to simulate motion 
-	ITERATIONS = 10, 		-- Number of iterations for motion simulation
+
+	MAX_BOUNCES = 3,        -- Bounces before the fireball explodes
+	DRAG = 0.15,            -- Air resistance
+	RESTITUTION = 0.7,      -- Fraction of speed kept after a bounce
+
+	-- Simulation values
+	PHYSICS_STEP = 1 / 60,  -- Fixed time step shared by live physics, aim solver and preview
+	MAX_FRAME_TIME = 0.1,   -- Cap on accumulated time so a lag spike can't cause a burst of steps
+	PREVIEW_TIME = 2,       -- Seconds of flight shown by the trajectory preview
+	AIM_REFINE_STEPS = 10,  -- Bisection passes that refine the aim solution (more = more accurate)
 }
 
-local GRAVITY = Vector3.new(0, -workspace.Gravity, 0)	-- Calculated once
-local fireballRadius = CONFIG.MIN_SIZE					-- Changed dynamically, set here so it's not nil
+local GRAVITY = Vector3.new(0, -workspace.Gravity, 0)   -- Calculated once
+local fireballScale = CONFIG.MIN_SIZE                   -- Changes while charging; set here so it's never nil
 
-
-local fireballFolder = Instance.new("Folder")		-- Folder to hold all fireball instances	
+local fireballFolder = Instance.new("Folder")           -- Holds every fireball and preview part
 fireballFolder.Name = "Fireballs"
 fireballFolder.Parent = workspace
 
-local rayParams = RaycastParams.new()					
-rayParams.FilterType = Enum.RaycastFilterType.Exclude	-- Set filter to exclude parameters
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude   -- Ignore filtered instances when casting
 
-
-type FireballData = {		-- Fireball data type, new fireball instaces are created from this
-	Model: Model,			
+-- Fields stored on every fireball instance
+type FireballData = {
+	Model: Model,
 	Position: Vector3,
 	Velocity: Vector3,
+	Radius: number,     -- Collision radius measured from the model at launch
 	Bounces: number,
-	Age: number,		-- In seconds
+	Age: number,        -- In seconds
 	Alive: boolean,
-	Size: number,
 }
 
+-- Rebuild the ignore list so casts skip fireballs and the current character
 local function refreshRayFilter()
-	local filter: { Instance } = {	-- Add fireballs in fireballFolder to filter...
-		fireballFolder,
-	}
+	local filter: { Instance } = { fireballFolder }
 
 	if player.Character then
-		table.insert(filter, player.Character)	-- Add player's character to filter
+		table.insert(filter, player.Character) -- Fireballs dont collide with their owner
 	end
 
-	rayParams.FilterDescendantsInstances = filter	
+	rayParams.FilterDescendantsInstances = filter
 end
 
-local function stepMotion(position: Vector3, velocity: Vector3, size: number, dt: number): (Vector3, Vector3, RaycastResult?)
-	
-	local newVelocity = (velocity + GRAVITY * dt) * math.max(0, 1 - CONFIG.DRAG * dt) -- Calculate velocity using old velocity, gravity and drag
-	
-	local newPosition = position + (velocity + newVelocity) * 0.5 * dt	-- Use average of old and new velocity to calculate position
-	local offset = newPosition - position	-- Calculate offset...
-	
-	local hit = if offset.Magnitude > 0 then 	-- return nil if 0
-		workspace:Spherecast(position, size, offset, rayParams) -- Spherecast to find collisions
+-- The model is scaled while charging so its radius is read from its current size
+local function modelRadius(model: Model): number
+	local size = model:GetExtentsSize()
+	return math.max(size.X, size.Y, size.Z) / 2 -- Half the largest side of the bounding box
+end
+
+-- Advances one step of motion and returns the new position, new velocity and any collision
+local function stepMotion(position: Vector3,velocity: Vector3,radius: number,dt: number): (Vector3, Vector3, RaycastResult?)
+	local newVelocity = (velocity + GRAVITY * dt) * math.max(0, 1 - CONFIG.DRAG * dt) -- Add gravity, then apply drag
+	local newPosition = position + (velocity + newVelocity) * 0.5 * dt -- Trapezoid rule: move by the average velocity
+	local offset = newPosition - position
+
+	local hit = if offset.Magnitude > 0
+		then workspace:Spherecast(position, radius, offset, rayParams) -- Cast sphere along the movement
 	else nil
 
-	if hit then -- If collision is found...
-		return position + offset.Unit * hit.Distance + hit.Normal * CONFIG.SKIN, newVelocity, hit -- Return hit position, velocity, and hit info...
+	if hit then
+		-- Pushed away by SKIN so the next cast doesnt start inside it
+		return position + offset.Unit * hit.Distance + hit.Normal * CONFIG.SKIN, newVelocity, hit
 	end
 
-	return newPosition, newVelocity, nil	-- Failsafe since current hit info can't exist without collision
+	return newPosition, newVelocity, nil -- No collision this step 
 end
 
+-- Reflects velocity off a surface and removes the energy lost in the bounce
 local function bouncedVelocity(velocity: Vector3, normal: Vector3): Vector3
-	return (velocity - 2 * velocity:Dot(normal) * normal) * CONFIG.RESTITUTION	-- Return velocity after a bounce
+	return (velocity - 2 * velocity:Dot(normal) * normal) * CONFIG.RESTITUTION -- Mirror around the normal, keep part of speed
 end
 
+local Fireball = {}
+Fireball.__index = Fireball
 
-local Fireball = {}				-- Fireball class
-Fireball.__index = Fireball		-- Set the metatable
+type Fireball = typeof(setmetatable({} :: FireballData, Fireball))
 
-type Fireball = typeof(			
-	setmetatable({} :: FireballData, Fireball)	
-)
-
-local activeFireballs: { Fireball } = {}	-- Holds list of active fireballs
+local activeFireballs: { Fireball } = {}
 
 function Fireball.new(model: Model, position: Vector3, velocity: Vector3): Fireball
-
-	local data: FireballData = {	
+	local data: FireballData = {
 		Model = model,
 		Position = position,
 		Velocity = velocity,
+		Radius = modelRadius(model), -- Measured once since size stops after release
 		Bounces = 0,
 		Age = 0,
 		Alive = true,
-		Size = fireballRadius,
 	}
 
-	return setmetatable(data, Fireball)	-- Return new fireball instance
+	return setmetatable(data, Fireball)
 end
 
 function Fireball.Destroy(self: Fireball)
-	self.Alive = false			
-	self.Model:Destroy()		-- Destroy the fireball model
+	self.Alive = false 
+	self.Model:Destroy()
 end
 
+-- Advance one physics step
 function Fireball.Step(self: Fireball, dt: number)
-	self.Age += dt		-- Age fireball using delta time
+	self.Age += dt	-- Age fireball by delta time
 
-	if self.Age > CONFIG.LIFETIME then	-- Check age first...
-		self:Destroy()		-- destroy and return if too old
-		return
-	end
-	
-	-- Calculates the position of the fireball at time t given its initial position and velocity
-	local newPosition, newVelocity, hit = stepMotion(self.Position, self.Velocity, self.Size, dt) 
-
-	if hit then		-- If collision occurs...
-		self:OnHit(hit, newVelocity, newPosition) -- Handle the collision
+	if self.Age > CONFIG.LIFETIME then -- If too old...
+		self:Destroy()	-- Remove
 		return
 	end
 
+	local newPosition, newVelocity, hit = stepMotion(self.Position, self.Velocity, self.Radius, dt)
+
+	if hit then
+		self:OnHit(hit, newVelocity, newPosition) -- Bounce or explode
+		return
+	end
+
+	-- Save for next step
 	self.Position = newPosition
 	self.Velocity = newVelocity
 
-	self.Model:PivotTo(
-		CFrame.lookAt(
-			newPosition,
-			newPosition + newVelocity
-		)
-	)
+	self.Model:PivotTo(CFrame.lookAt(newPosition, newPosition + newVelocity)) -- Point the model along its travel direction
 end
 
 function Fireball.OnHit(self: Fireball, hit: RaycastResult, incoming: Vector3, contact: Vector3)
-	self.Position = contact		-- Save contact point with collision
+	self.Position = contact	
 
-	if self.Bounces >= CONFIG.MAX_BOUNCES then		-- Check bounces first...
-		self:Explode()		-- Explode if max bounces reached
+	if self.Bounces >= CONFIG.MAX_BOUNCES then -- If bounces > limit...
+		self:Explode()	--- Remove
 		return
 	end
 
-	self.Bounces += 1	-- Increment bounce counter since collision = bounce
+	self.Bounces += 1
+	self.Velocity = bouncedVelocity(incoming, hit.Normal)	
 
-	self.Velocity = bouncedVelocity(incoming, hit.Normal)	-- Calculate new velocity after bounce
-
-	self.Model:PivotTo(CFrame.lookAt( self.Position, self.Position + self.Velocity)) -- Update fireball position and direction to avoid clipping issues
+	-- Move the model to the contact point now so it doesn't visibly clip into the surface
+	self.Model:PivotTo(CFrame.lookAt(self.Position, self.Position + self.Velocity))
 end
 
 function Fireball.Explode(self: Fireball)
-	
-	-- Create Roblox explosion 
-	local explosion = Instance.new("Explosion")		
-	explosion.BlastRadius = CONFIG.BLAST_RADIUS
-	explosion.Position = self.Position
-	explosion.BlastPressure = CONFIG.BLAST_PRESSURE
-	explosion.Parent = workspace
 
-	self:Destroy()	-- Destroy fireball
+	-- Create Roblox explosion
+	local explosion = Instance.new("Explosion")
+	explosion.BlastRadius = CONFIG.BLAST_RADIUS
+	explosion.BlastPressure = CONFIG.BLAST_PRESSURE
+	explosion.DestroyJointRadiusPercent = 0 
+	explosion.Position = self.Position
+	explosion.Parent = workspace -- Parenting the explosion triggers it
+
+	self:Destroy()
 end
 
-local heldFireball: Model? = nil					-- Holds reference to currently charging fireball (nil when not charging)
-local trackConnection: RBXScriptConnection? = nil	-- Holds connection to  Heartbeat function while fireball is held
+local heldFireball: Model? = nil                    -- The fireball being charged (nil when not charging)
+local trackConnection: RBXScriptConnection? = nil   -- Heartbeat connection that runs while charging
 
-local canFire = true	-- Flag to prevent spamming fireballs
+local canFire = true       -- False during cooldown
+local chargeStart = 0       -- os.clock() when the current charge began
+local cooldownEnd = 0       -- os.clock() when the current cooldown ends
 
 local function getRoot(): BasePart?
-	local character = player.Character	-- Get character model
+	local character = player.Character
 
-	return character	-- Return character model...
-		and character:FindFirstChild("HumanoidRootPart") :: BasePart?	-- and its root part
+	return character -- Nil if there is no character...
+		and character:FindFirstChild("HumanoidRootPart") :: BasePart? -- otherwise its root part
 end
 
+-- Held fireballs are anchored and invisible to physics queries so they never push or block anything
 local function prepareModel(model: Model)
-	for _, descendant in model:GetDescendants() do
-		if descendant:IsA("BasePart") then
-			descendant.Anchored = true
-			descendant.CanCollide = false
-			descendant.CanQuery = false
+	for _, descendant in model:GetDescendants() do -- For every descendant of the fireball model...
+		if descendant:IsA("BasePart") then -- If it is a part...
+
+			-- Disable physics
+			descendant.Anchored = true 
+			descendant.CanCollide = false 
+			descendant.CanQuery = false 
 		end
 	end
 end
 
+-- Direction from origin to the mouse 
 local function getAimDirection(origin: Vector3, fallback: Vector3): Vector3
+	local difference = mouse.Hit.Position - origin
 
-	local difference = mouse.Hit.Position - origin -- Get direction from fireball origin to mouse position
-
-	if difference.Magnitude < 0.1 then -- If mouse is too close to fireball origin...
-		return fallback	-- Use fallback direction instead 
+	if difference.Magnitude < 0.1 then -- Too close for a reliable direction
+		return fallback	-- fallback when the mouse is on top of the origin
 	end
 
 	return difference.Unit
 end
 
-local function getFireballPosition(root: BasePart): (Vector3, Vector3)
+-- Returns where the fireball is held and the direction it is aimed
+local function getFireballPosition(root: BasePart, radius: number): (Vector3, Vector3)
+	local origin = root.Position + Vector3.new(0, CONFIG.HOLD_HEIGHT, 0)
 
-	local origin = root.Position + Vector3.new(0, CONFIG.HOLD_HEIGHT, 0) -- Set fireball origin to be held above the player at CONFIG.HOLD_HEIGHT studs
+	-- Lift the origin if the fireball would sink into the ground
+	local groundHit = workspace:Raycast(origin, Vector3.new(0, -radius, 0), rayParams)
 
-	local groundHit = workspace:Raycast(origin, Vector3.new(0, -fireballRadius, 0), rayParams) -- Raycast from fireball origin to the ground 
-
-	if groundHit and groundHit.Normal.Y > 0 then	-- If ray hits ground...
-		origin = groundHit.Position + groundHit.Normal * (fireballRadius + CONFIG.SKIN) -- Raise origin to be above the ground
+	if groundHit and groundHit.Normal.Y > 0 then -- Only upward facing surfaces count as ground
+		origin = groundHit.Position + groundHit.Normal * (radius + CONFIG.SKIN)
 	end
 
-	local direction = getAimDirection(origin, root.CFrame.LookVector) -- Calculate direction to aim fireball, using root part direction as fallback
+	local direction = getAimDirection(origin, root.CFrame.LookVector) -- Falls back to where the player is facing
 
-	local hit = workspace:Spherecast(origin, fireballRadius, direction * CONFIG.HOLD_DISTANCE, rayParams)	-- Check for a wall along the hold distance
+	-- Stop short of any wall between the player and the hold position
+	local hit = workspace:Spherecast(origin, radius, direction * CONFIG.HOLD_DISTANCE, rayParams)
 
-	-- Use the nearest obstruction to keep the held fireball clear of walls.
 	local distance =
 		if hit
-		then math.max(
-			0,
-			hit.Distance - CONFIG.SKIN
-		)
+		then math.max(0, hit.Distance - CONFIG.SKIN) -- Stop just before the wall
 		else CONFIG.HOLD_DISTANCE
 
-	return origin + direction * distance, direction	-- Return a position before the obstruction and the aim direction
+	return origin + direction * distance, direction
 end
 
--- Convert elapsed charging time to a value from 0 to 1.
+-- Convert elapsed charging time to a value from 0 to 1
 local function getCharge(): number
-	return math.clamp((os.clock() - chargeStart)/ CONFIG.CHARGE_TIME, 0, 1)
+	return math.clamp((os.clock() - chargeStart) / CONFIG.CHARGE_TIME, 0, 1)
 end
 
-
-
--- Show charge progress in the GUI.
 local function updateChargeBar()
 	chargeFill.Size = UDim2.fromScale(1, getCharge())
 end
 
 local function lerp(min: number, max: number, percent: number): number
-	return min + (max - min) * percent	-- Linear interpolation between two values
+	return min + (max - min) * percent
 end
 
+--[[
+	- Finds the launch velocity that makes the fireball land on the mouse position
+	- Position is linear in the launch velocity:
+	- position(t) = distanceFactor(t) * launchVelocity + gravityDistance(t)
+	- For each flight time, solves for the launch velocity needed to reach the target
+	- The first time that fits the charged speed wins 
+	- A bisection inside that step refines it 
+]]
 local function getLaunchVelocity(origin: Vector3, fallback: Vector3): Vector3
-	local speed = lerp(CONFIG.MIN_SPEED, CONFIG.MAX_SPEED, getCharge())	-- Increase launch speed as the staff charges
-	local upward = Vector3.new(0, CONFIG.UPWARD_VELOCITY, 0)	-- Keep an upward component on every shot
-	local delta = mouse.Hit.Position - origin	-- Direction from origin to mouse position
+	local speed = lerp(CONFIG.MIN_SPEED, CONFIG.MAX_SPEED, getCharge()) -- Speed grows with charge
+	local upward = Vector3.new(0, CONFIG.UPWARD_VELOCITY, 0) -- Added to every shot after aiming
+	local delta = mouse.Hit.Position - origin
 
-	if delta.Magnitude < 0.1 then	-- Use the character's facing direction for a nearby target
-		return fallback * speed + upward	-- Keep the same speed and upward lift on fallback
+	if delta.Magnitude < 0.1 then -- Target is on top of the fireball
+		return fallback * speed + upward 
 	end
 
-	local velocityFactor = 1				-- Initial launch velocity after drag that survived up to this point
-	local gravityVelocity = Vector3.zero	-- Velocity contribution from gravity
-	local distanceFactor = 0				-- Distance one unit of launch velocity travels by this time
-	local gravityDistance = Vector3.zero	-- Distance gravity alone pulled the projectile by this time
-	local step = CONFIG.PREVIEW_STEP		
+	local velocityFactor = 1                -- Share of the launch velocity that survived drag so far
+	local gravityVelocity = Vector3.zero   -- Velocity contribution from gravity
+	local distanceFactor = 0                -- Distance travelled per unit of launch velocity
+	local gravityDistance = Vector3.zero   -- Distance travelled because of gravity alone
+	local step = CONFIG.PHYSICS_STEP
 
-	-- Test flight times until the target can be reached at the charged speed.
-	for _ = 1, math.floor(CONFIG.LIFETIME / step) do	-- For every simulation step...
-		
-		local drag = math.max(0, 1 - CONFIG.DRAG * step)	-- Apply drag 
-		local nextFactor = velocityFactor * drag	-- Update the launch velocity contribution
-		local nextGravityVelocity = (gravityVelocity + GRAVITY * step) * drag	-- Update gravity's velocity contribution
-		local nextDistanceFactor = distanceFactor + (velocityFactor + nextFactor) * 0.5 * step	-- Accumulate launch velocity's distance contribution
-		local nextGravityDistance = gravityDistance + (gravityVelocity + nextGravityVelocity) * 0.5 * step	-- Accumulate gravity's distance contribution
-		local required = (delta - nextGravityDistance) / nextDistanceFactor - upward	-- Find the aim velocity needed to hit the mouse target
+	for _ = 1, math.floor(CONFIG.LIFETIME / step) do -- For every step the fireball could possibly fly for...
+		local drag = math.max(0, 1 - CONFIG.DRAG * step)
+		local nextFactor = velocityFactor * drag -- Launch velocity that survives drag after this step
+		local nextGravityVelocity = (gravityVelocity + GRAVITY * step) * drag
+		local nextDistanceFactor = distanceFactor + (velocityFactor + nextFactor) * 0.5 * step
+		local nextGravityDistance = gravityDistance + (gravityVelocity + nextGravityVelocity) * 0.5 * step
+		local required = (delta - nextGravityDistance) / nextDistanceFactor - upward -- Launch velocity that reaches the target at this time
 
-		if required.Magnitude <= speed then	-- Stop at the first flight time that fits the charged speed
-			local low = 0
-			local high = step
+		if required.Magnitude <= speed then -- If the charged speed can reach the target by this step...
+			local low = 0 -- flight time lies between the start...
+			local high = step -- ...and the end of this step
 			local aim = required
-			
-			
-			-- Iterate sub steps to narrow down the aim direction
-			for _ = 1, CONFIG.ITERATIONS do		-- More iterations = slower but more accurate aim prediction
-				local mid = (low + high) * 0.5	-- Midpoint of the current time interval
+
+			for _ = 1, CONFIG.AIM_REFINE_STEPS do -- For every refinement pass...
+				local mid = (low + high) * 0.5
 				local midDrag = math.max(0, 1 - CONFIG.DRAG * mid)
 				local midFactor = velocityFactor * midDrag
 				local midGravityVelocity = (gravityVelocity + GRAVITY * mid) * midDrag
-				
-				local a = distanceFactor + (velocityFactor + midFactor) * 0.5 * mid
-				local b = gravityDistance + (gravityVelocity + midGravityVelocity) * 0.5 * mid
-				
-				local candidate = (delta - b) / a - upward	-- Find the aim needed at this midpoint
-				if candidate.Magnitude > speed then	-- If too slow...
-					low = mid	-- move lower bound up
-				else			-- Else if too fast...
-					high = mid	-- move upper bound down
+
+				local a = distanceFactor + (velocityFactor + midFactor) * 0.5 * mid -- distance factor at the midpoint time
+				local b = gravityDistance + (gravityVelocity + midGravityVelocity) * 0.5 * mid -- Gravity distance at the midpoint time
+
+				local candidate = (delta - b) / a - upward
+
+				if candidate.Magnitude > speed then -- Needs more speed than we have 
+					low = mid -- try more flight time
+				else -- Reachable 
+					high = mid	-- try shorter flight time
 					aim = candidate
 				end
 			end
-			return aim.Unit * speed + upward	-- Launch at charged speed using the reachable aim
+
+			return aim.Unit * speed + upward -- Launch at the charged speed along the refined aim
 		end
-		
-		-- Carry this step's motion factors into the next step
-		velocityFactor = nextFactor	
+
+		velocityFactor = nextFactor -- Carry this steps values into the next step
 		gravityVelocity = nextGravityVelocity
 		distanceFactor = nextDistanceFactor
 		gravityDistance = nextGravityDistance
 	end
 
-	return fallback * speed + upward	-- Use the fallback direction if the target is out of reach
+	return fallback * speed + upward -- Target is out of reach
 end
 
--- Reuse preview parts instead of creating them every frame.
-local previewParts: { Part } = {}
-local lastPreview = -math.huge	-- Time of the last preview update
+local previewParts: { Part } = {}   -- Reused every update instead of creating new parts
+local lastPreview = -math.huge      -- os.clock() of the last preview update
 
--- Hide the trajectory when aiming stops.
+-- Hides the trajectory when aiming stops
 local function clearPreview()
-	for _, part in previewParts do	-- For each preview segment...
-		part.Transparency = 1	-- Make the segment invisible
+	for _, part in previewParts do -- For every preview segment...
+		part.Transparency = 1 -- Hide it
 	end
 end
 
--- Simulate and draw the predicted path using the live motion step.
-local function updatePreview(origin: Vector3, launchVelocity: Vector3)
-	local position = origin			-- Begin the preview at the held fireball
-	local velocity = launchVelocity	-- Start with the calculated launch velocity
-	local bounces = 0				-- Count predicted bounces
-	local used = 0					-- Count visible preview segments
+-- Simulates the flight with the same physics as a real fireball and draws it as line segments
+local function updatePreview(origin: Vector3, launchVelocity: Vector3, radius: number)
+	local position = origin
+	local velocity = launchVelocity
+	local bounces = 0
+	local used = 0 -- Number of segments drawn this update
 
-	for _ = 1, math.floor(CONFIG.PREVIEW_TIME / CONFIG.PREVIEW_STEP) do	-- For each preview step...
-		
-		-- Calculate the motion of the fireball for this step
-		local nextPosition, nextVelocity, hit = stepMotion(position, velocity, fireballRadius, CONFIG.PREVIEW_STEP)	
-		
-		local length = (nextPosition - position).Magnitude -- Lenght of this step's motion
+	for _ = 1, math.floor(CONFIG.PREVIEW_TIME / CONFIG.PHYSICS_STEP) do -- For every step of the previewed flight...
+		local nextPosition, nextVelocity, hit = stepMotion(position, velocity, radius, CONFIG.PHYSICS_STEP)
+		local length = (nextPosition - position).Magnitude
 
-		if length > 0.001 then	-- Skip steps too short to draw
-			used += 1	-- Increment the number of drawn segments
-			local part = previewParts[used]	-- Reuse the segment at this path index
-			if not part then	-- Create a segment only when the path grows
+		if length > 0.001 then -- If the step is long enough to draw...
+			used += 1
+			local part = previewParts[used] -- Reuse the segment at this index if it exists
+
+			if not part then -- Create a segment only when the path grows
 				part = Instance.new("Part")
 				part.Name = "TrajectoryPreview"
 				part.Anchored = true
 				part.CanCollide = false
-				part.CanQuery = false
+				part.CanQuery = false -- Keeps the mouse and raycasts from hitting the preview
 				part.CanTouch = false
 				part.Material = Enum.Material.Neon
 				part.Color = Color3.fromRGB(0, 0, 255)
 				part.Parent = fireballFolder
-				previewParts[used] = part
+				previewParts[used] = part -- Store it for reuse
 			end
-			part.Size = Vector3.new(0.12, 0.12, length)	-- Match the segment to this step's length
-			part.CFrame = CFrame.lookAt((position + nextPosition) * 0.5, nextPosition)	-- Place it between the old and new positions
-			part.Transparency = 0.25	-- Show the segment
+
+			part.Size = Vector3.new(0.12, 0.12, length) -- As long as this step
+			part.CFrame = CFrame.lookAt((position + nextPosition) * 0.5, nextPosition) -- Centered between the old and new positions
+			part.Transparency = 0.25 -- Show it
 		end
 
-		position = nextPosition	-- Carry over this step's position and velocity for the next step
+		position = nextPosition
 		velocity = nextVelocity
-		
-		-- Apply the same bounce limit and reflection as a real fireball.
-		if hit then		-- If bounce...
-			if bounces >= CONFIG.MAX_BOUNCES then	-- If bounces > limit...
-				break	-- Stop preview
+
+		if hit then -- If the simulated fireball hit something...
+			if bounces >= CONFIG.MAX_BOUNCES then -- If it has no bounces left...
+				break -- Real fireball explodes here
 			end
-			bounces += 1	-- Count this bounce
-			velocity = bouncedVelocity(velocity, hit.Normal)	-- Calculate the same bounce as a real fireball
+
+			bounces += 1
+			velocity = bouncedVelocity(velocity, hit.Normal) -- Same bounce as a real fireball
 		end
 	end
 
-
-	for i = used + 1, #previewParts do		-- For all unused preview segments...
-		previewParts[i].Transparency = 1	-- Hide the preview segment
+	for i = used + 1, #previewParts do -- For every segment not used this update...
+		previewParts[i].Transparency = 1 -- Hide it
 	end
 end
 
--- Keep the charging fireball and preview aimed from the player's current position.
+-- Keeps the chargin gfireball and preview aimed from the players current position
 local function updateHeldFireball(model: Model)
-	local root = getRoot()	-- Find the player's root part
+	local root = getRoot()
+
 	if not root then
-		clearPreview()	-- Clear the path when no character root is available
+		clearPreview()
 		return
 	end
 
-	local position, direction = getFireballPosition(root)		-- Find the held position and direction
-	local velocity = getLaunchVelocity(position, direction)		-- Aim with the current charge
-	model:PivotTo(CFrame.lookAt(position, position + velocity))	-- Point the held model along its launch velocity
+	local radius = modelRadius(model) -- Remeasured each time since the model grows while charging
+	local position, direction = getFireballPosition(root, radius)
+	local velocity = getLaunchVelocity(position, direction)
 
-	
-	if os.clock() - lastPreview >= 0.1 then -- Refresh the trajectory at most ten times per second
-		lastPreview = os.clock()	-- Save the preview update time
-		updatePreview(position, velocity)	-- Draw the new path
+	model:PivotTo(CFrame.lookAt(position, position + velocity)) -- Point the held model along its launch velocity
+
+	-- Preview is costly -> measure only 10 times a second to improve performance
+	if os.clock() - lastPreview >= 0.1 then
+		lastPreview = os.clock()
+		updatePreview(position, velocity, radius)
 	end
 end
 
-
 local function stopTracking()
-	if trackConnection then	
-		trackConnection:Disconnect()	-- Disconnect aim tracking...
-		trackConnection = nil			-- and clear the held state
+	if trackConnection then
+		trackConnection:Disconnect()
+		trackConnection = nil
 	end
 
-	heldFireball = nil	-- Clear the held model reference
-	mouse.TargetFilter = nil	-- Allow the mouse to target the world again
+	heldFireball = nil
+	mouse.TargetFilter = nil -- Let the mouse target the world normally again
 	clearPreview()
 end
 
 local function SpawnFireball()
-	if heldFireball or not canFire or not getRoot() then	-- Ignore duplicate, cooling-down, or rootless activation
+	if heldFireball or not canFire or not getRoot() then -- Check if can fire
 		return
 	end
 
-	chargeStart = os.clock()	-- Record when charging began
+	chargeStart = os.clock()
+	updateChargeBar()
 
-	updateChargeBar()	-- Update charge bar
-	
-	-- Show the charge bar
-	chargeGui.Enabled = true		
-	chargeFill.Visible = true		
-	
-	cooldownLabel.Visible = false	-- Disable the cooldown display when charging
+	chargeGui.Enabled = true
+	chargeFill.Visible = true
+	cooldownLabel.Visible = false -- The cooldown timer is only shown after firing
 
-	local fireball = fireballTemplate:Clone()	-- Make a separate model for this shot
-
-	prepareModel(fireball)	-- Anchor the model and disable physical collisions
-
+	local fireball = fireballTemplate:Clone() -- A separate model for this shot
+	prepareModel(fireball)
 	fireball.Name = "FireballInstance"
 
-	mouse.TargetFilter = fireball	-- Keep the held model out of mouse targeting
-	heldFireball = fireball			-- Set this fireball as being held
+	-- Everything in the folder (held model and preview parts) is ignored by the mouse
+	-- otherwise the aim point could land on our own preview
+	mouse.TargetFilter = fireballFolder
+	heldFireball = fireball
 
-	fireballRadius = CONFIG.MIN_SIZE	-- Start each charge at the minimum size
+	fireballScale = CONFIG.MIN_SIZE -- Every charge starts at the smallest size
+	fireball:ScaleTo(fireballScale)
 
-	fireball:ScaleTo(fireballRadius)	-- Scale the held model to its initial size
+	updateHeldFireball(fireball) -- Place and aim the model before it becomes visible
+	fireball.Parent = fireballFolder
 
-	updateHeldFireball(fireball)	-- Place and aim the held model immediately
+	-- While LMB (on pc) is held
+	trackConnection = RunService.Heartbeat:Connect(function()
+		fireballScale = lerp(CONFIG.MIN_SIZE, CONFIG.MAX_SIZE, getCharge())
+		fireball:ScaleTo(fireballScale) -- Scale first so the radius measured below is current
 
-	fireball.Parent = fireballFolder	-- Put the model with the other fireballs
-
-	-- Grow the held fireball and charge bar while the button is down.
-	trackConnection = RunService.Heartbeat:Connect(function()	
-		fireballRadius = lerp(CONFIG.MIN_SIZE, CONFIG.MAX_SIZE, getCharge())
-		fireball:ScaleTo(fireballRadius)	-- Grow the model to match charge
-
-		updateHeldFireball(fireball)	-- Reposition the model and refresh the charge display
-		updateChargeBar()
+		updateHeldFireball(fireball)	-- Re-Aim fireball
+		updateChargeBar()	
 	end)
 end
 
--- Discard a charge when the staff is unequipped or the character changes.
+
 local function cancelFireball()
-	if heldFireball then heldFireball:Destroy() end -- Remove the held model if charging was interrupted
+	if heldFireball then		-- If charge is held...
+		heldFireball:Destroy()	-- Discard fireball
+	end
 
-	chargeGui.Enabled = false	-- Hide the charge GUI
-
-	stopTracking()	-- Clear tracking, target filtering, and the preview
+	chargeGui.Enabled = false
+	stopTracking()
 end
 
--- Turn the held model into an active fireball when the button is released.
+-- Turn the held model into an active fireball when the button is released
 local function ReleaseFireball()
-	local fireball = heldFireball	-- Read the model held during charging
-	local primary = fireball and fireball.PrimaryPart
+	local fireball = heldFireball
 
-	if not fireball or not primary then	-- Ignore release when there is no usable model
+	if not fireball then -- Nothing was being charged
 		return
 	end
 
-	local root = getRoot()	-- Find the root for a fallback aim direction
-	local fallback = getAimDirection(primary.Position, if root then root.CFrame.LookVector else primary.CFrame.LookVector) -- Get a fallback aim direction
-	local velocity = getLaunchVelocity(primary.Position, fallback)	-- Calculate launch velocity at the model's current position
-	fireball:PivotTo(CFrame.lookAt(primary.Position, primary.Position + velocity))	-- Face the model along its launch direction
+	local pivot = fireball:GetPivot() -- Works even if the model has no PrimaryPart
+	local root = getRoot()
+	local fallback = getAimDirection( -- Used if the mouse is too close to aim at
+		pivot.Position,
+		if root then root.CFrame.LookVector else pivot.LookVector	-- Root chheck
+	)
+	local velocity = getLaunchVelocity(pivot.Position, fallback)
 
-	-- Add the released model to the physics update list.
-	table.insert(activeFireballs, Fireball.new( fireball, primary.Position, velocity))
+	fireball:PivotTo(CFrame.lookAt(pivot.Position, pivot.Position + velocity))
+	table.insert(activeFireballs, Fireball.new(fireball, pivot.Position, velocity)) -- Hand it to the physics loop
 
-	stopTracking()	-- Stop following the mouse after release
+	stopTracking()
 
-	-- Start cooldown
 	canFire = false
 	cooldownEnd = os.clock() + CONFIG.COOLDOWN
 
-	-- Keep GUI enabled so the cooldown can be seen.
+	-- Swap the charge bar for the cooldown timer
 	chargeGui.Enabled = true
 	chargeFill.Visible = false
 	cooldownLabel.Visible = true
-	
-	
-	task.delay(CONFIG.COOLDOWN, function()	
-		canFire = true					-- Reset after cooldown
-		cooldownLabel.Visible = false	
+
+	task.delay(CONFIG.COOLDOWN, function() -- When the cooldown ends...
+		canFire = true
+		cooldownLabel.Visible = false
 		chargeGui.Enabled = false
 	end)
 end
 
--- Main physics heartbeat function
-RunService.Heartbeat:Connect(function(dt: number)
-	
-
-	for i = #activeFireballs, 1, -1 do		-- For all fireballs (backwards so it doesn't delete new fireballs)...
+local function stepFireballs(dt: number)
+	for i = #activeFireballs, 1, -1 do -- For every active fireball (backwards so removing one does not skip the next)...
 		local fireball = activeFireballs[i]
 
-		if fireball.Alive then	
-			fireball:Step(dt)	-- Advance each living fireball
-		else
-			table.remove(activeFireballs, i)	-- Remove destroyed fireballs from the list
+		if fireball.Alive then -- Step if still alive...
+			fireball:Step(dt)
+		else -- Otherwise destroy it
+			table.remove(activeFireballs, i)
 		end
 	end
+end
 
-	
-	if not canFire then
-		local remaining = math.max(0, cooldownEnd - os.clock()) -- Remaining cooldown time
+local physicsAccumulator = 0    -- Time waiting to be consumed by fixed physics steps
 
-		cooldownLabel.Text = string.format("%.2f", remaining) -- Show remaining cooldown on GUI
+-- Main loop
+RunService.Heartbeat:Connect(function(dt: number)
+	physicsAccumulator = math.min(physicsAccumulator + dt, CONFIG.MAX_FRAME_TIME) -- Capped so a lag spike can't cause a burst of steps
+
+	while physicsAccumulator >= CONFIG.PHYSICS_STEP do -- While there is enough stored time for another step...
+		physicsAccumulator -= CONFIG.PHYSICS_STEP	-- Count down time
+		stepFireballs(CONFIG.PHYSICS_STEP)		-- Do a step
+	end
+
+	if not canFire then -- If can't fire...
+
+		-- Update cooldown text
+		local remaining = math.max(0, cooldownEnd - os.clock())
+		cooldownLabel.Text = string.format("%.2f", remaining)
 	end
 end)
 
-
 local function giveStaff()
-	local staff = staffTemplate:Clone()	-- Clone the staff template for this player
+	local staff = staffTemplate:Clone() 
 
-	staff.Activated:Connect(SpawnFireball)	-- Charge on activation (LMB)...
-	staff.Deactivated:Connect(ReleaseFireball)	-- fire on release
-	staff.Unequipped:Connect(cancelFireball)	-- Cancel an unfinished charge when unequipped
+	staff.Activated:Connect(SpawnFireball) -- Start charging on click...
+	staff.Deactivated:Connect(ReleaseFireball) -- ...fire on release
+	staff.Unequipped:Connect(cancelFireball) -- Cancel an unfinished charge if the staff is put away
 
-	staff.Parent = player:WaitForChild("Backpack") -- Put staff in player backpack
+	staff.Parent = player:WaitForChild("Backpack") -- Give staff to player
 end
 
-refreshRayFilter()	-- Initialize the collision filter
-giveStaff()	-- Give the initial staff
+refreshRayFilter() -- Init raycast filter
+giveStaff() 
 
-player.CharacterAdded:Connect(function() -- When player respawns...
-	cancelFireball()	-- Cancel a charge from the previous character
-	refreshRayFilter()	-- Exclude the new character from fireball casts
-	giveStaff()	-- Give the respawned character a staff
+player.CharacterAdded:Connect(function() -- When the player respawns...
+	cancelFireball() -- Drop any charge from the previous character
+	refreshRayFilter() -- Exclude the new character from casts
+	giveStaff()
 end)

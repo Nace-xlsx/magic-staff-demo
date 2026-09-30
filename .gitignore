@@ -1,0 +1,9 @@
+# Project place file
+/magic-staff-demo.rbxlx
+/asd.rbxl
+
+# Roblox Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+sourcemap.json
